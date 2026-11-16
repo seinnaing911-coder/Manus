@@ -15,7 +15,6 @@ OPENROUTER_MODEL = "openrouter/free"
 XAI_STT_MODEL = "grok-voice-transcribe-2.0"
 XAI_TTS_VOICE = "eve"
 XAI_TTS_LANGUAGE = "my"
-LOCAL_WHISPER_MODEL = "tiny"
 CHUNK_SECONDS = 480
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="centered")
@@ -169,8 +168,7 @@ def approximate_segments(text, offset, duration):
 
 def local_whisper_transcribe(audio_path):
     from faster_whisper import WhisperModel
-    model = WhisperModel(secret("LOCAL_WHISPER_MODEL", LOCAL_WHISPER_MODEL),
-                         device="cpu", compute_type="int8")
+    model = WhisperModel("small", device="cpu", compute_type="int8")
     segments, _ = model.transcribe(str(audio_path), beam_size=3, vad_filter=True)
     return normalize_segments([{"start": s.start, "end": s.end, "text": s.text.strip()}
                                for s in segments if s.text.strip()], probe_duration(audio_path))
@@ -239,25 +237,6 @@ def call_translation_api(prompt, provider, api_key):
     return response.json()["choices"][0]["message"]["content"]
 
 
-def free_translate_text(text):
-    """Use the free Google Translate web endpoint through deep-translator."""
-    from deep_translator import GoogleTranslator
-    return GoogleTranslator(source="auto", target="my").translate(text).strip()
-
-
-def free_translate_segments(segments, progress_callback=None):
-    translated = []
-    for index, seg in enumerate(segments):
-        try:
-            burmese = free_translate_text(seg["text"])
-        except Exception:
-            burmese = seg["text"]
-        translated.append({**seg, "burmese": burmese or seg["text"]})
-        if progress_callback:
-            progress_callback((index + 1) / len(segments))
-    return translated, "Free Google Translate"
-
-
 def translate_segments(segments, grok_key, gemini_key, openrouter_key, progress_callback=None):
     translated = []
     batch_size = 18
@@ -292,8 +271,6 @@ def translate_segments(segments, grok_key, gemini_key, openrouter_key, progress_
             except Exception as exc:
                 errors.append(f"OpenRouter: {str(exc)[:160]}")
         if raw is None:
-            if not (gemini_key or openrouter_key):
-                return free_translate_segments(segments, progress_callback)
             raise RuntimeError("မြန်မာဘာသာပြန် API မရပါ။ " + " | ".join(errors))
         rows = parse_json_array(raw)
         mapping = {}
@@ -444,7 +421,7 @@ def render_dubbed_video(source, prepared_audio, duration, srt_path, output_path,
 def main():
     st.title(APP_TITLE)
     st.write("Video တစ်ခုတည်းတင်ပါ။ မူရင်းအသံအားလုံးကို ဖယ်ရှားပြီး မြန်မာအသံနဲ့ အစားထိုးပေးပါမယ်။")
-    st.info("မူရင်းဘာသာစကားအသံကို Final MP4 ထဲ မထည့်ဘဲ မြန်မာအသံတစ်ခုတည်း ထည့်ပေးပါမယ်။ API key မရှိရင် Free mode နဲ့ local processing လုပ်နိုင်ပါတယ်။")
+    st.info("မူရင်းစကားပြောသံ၊ တေးဂီတ၊ ပတ်ဝန်းကျင်အသံအားလုံးကို Final MP4 ထဲ မထည့်ပါ။ Blur နေရာကို Preview ပေါ်တွင် ကိုယ်တိုင်ဆွဲရွေးနိုင်ပါသည်။")
 
     grok_key = secret("XAI_API_KEY")
     gemini_key = secret("GEMINI_API_KEY")
@@ -463,9 +440,7 @@ def main():
         active_providers.append("Grok")
     if groq_key:
         active_providers.append("Groq fallback")
-    if not active_providers:
-        active_providers.append("Free local Whisper → Free translation → Edge TTS")
-    st.caption("အသုံးပြုမည့် processing mode: " + " → ".join(active_providers))
+    st.caption("အသုံးပြုမည့် AI providers: " + (" → ".join(active_providers) if active_providers else "မသတ်မှတ်ရသေးပါ"))
     voice_label = st.selectbox("မြန်မာအသံရွေးချယ်ပါ", ["နီလာ (မိန်းကလေး)", "သီဟ (ယောက်ျားလေး)"])
     burn_subtitles = st.checkbox("မြန်မာစာတန်းထိုးကို Video ပေါ်တွင်ပါ ထည့်မယ်", value=True)
     subtitle_size = st.slider("စာတန်းထိုး စာလုံးအရွယ်", 18, 48, 30)
@@ -572,7 +547,10 @@ def main():
 
     if st.button("🎙️ မြန်မာအသံနဲ့ Dubbing လုပ်မယ်", type="primary", disabled=uploaded is None):
         if not (grok_key or groq_key):
-            st.info("API key မတွေ့ပါ။ Free local Whisper mode ကို အသုံးပြုနေပါတယ်။ ပထမဆုံး run မှာ Whisper model download လုပ်ရနိုင်ပါတယ်။")
+            st.error("XAI_API_KEY သို့မဟုတ် GROQ_API_KEY တစ်ခု လိုအပ်ပါတယ်။")
+            st.stop()
+        if not (grok_key or gemini_key or openrouter_key):
+            st.error("XAI_API_KEY လိုအပ်ပါတယ်။ Grok translation အတွက် XAI_API_KEY ထည့်ပါ။")
             st.stop()
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -596,7 +574,7 @@ def main():
                 extract_audio(video, original_audio)
                 set_progress(8, "အသံဖိုင် ပြင်ဆင်ပြီးပါပြီ")
 
-                status.info("Grok Voice STT သို့မဟုတ် Free local Whisper ဖြင့် မူရင်းစကားပြောသံနှင့် အချိန်မှတ်တမ်း ထုတ်ယူနေသည်...")
+                status.info("Grok Voice STT ဖြင့် မူရင်းစကားပြောသံနှင့် အချိန်မှတ်တမ်း ထုတ်ယူနေသည်...")
                 try:
                     if not grok_key:
                         raise RuntimeError("XAI_API_KEY မရှိပါ")
