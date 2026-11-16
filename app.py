@@ -1,5 +1,7 @@
-import os, re, json, time, tempfile, subprocess, shutil, asyncio
+import os, re, json, time, tempfile, subprocess, shutil, asyncio, hashlib
 from pathlib import Path
+
+from PIL import Image
 
 import streamlit as st
 import requests
@@ -42,8 +44,31 @@ def probe_duration(path):
     return max(0.1, float(value))
 
 
+def probe_video_info(path):
+    raw = run_cmd(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                   "-show_entries", "stream=width,height", "-of", "json", str(path)])
+    streams = json.loads(raw).get("streams") or []
+    if not streams:
+        raise RuntimeError("Video stream မတွေ့ပါ။")
+    return int(streams[0]["width"]), int(streams[0]["height"])
+
+
+def has_audio_stream(path):
+    raw = run_cmd(["ffprobe", "-v", "error", "-select_streams", "a:0",
+                   "-show_entries", "stream=index", "-of", "json", str(path)])
+    return bool(json.loads(raw).get("streams") or [])
+
+
+def extract_preview_frame(video_path, seconds, output_path, max_width=720):
+    run_cmd([ffmpeg_path(), "-y", "-ss", f"{max(0, seconds):.3f}", "-i", str(video_path),
+             "-frames:v", "1", "-vf", f"scale='min({max_width},iw)':-2",
+             "-q:v", "3", str(output_path)], timeout=180)
+
+
 def extract_audio(video_path, audio_path):
     # Original audio is extracted only for transcription. It is never copied to the final MP4.
+    if not has_audio_stream(video_path):
+        raise RuntimeError("ဒီ Video ထဲမှာ မူရင်းအသံ Track မရှိပါ။ စကားပြောသံပါဝင်သော Video ကို တင်ပေးပါ။")
     run_cmd([ffmpeg_path(), "-y", "-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000",
              "-c:a", "libmp3lame", "-b:a", "48k", str(audio_path)], timeout=1800)
 
@@ -233,48 +258,37 @@ def build_voice_track(segments, voice, workdir, duration, progress_callback=None
     tts_dir = workdir / "tts_segments"
     tts_dir.mkdir(exist_ok=True)
     prepared = []
-
+    cursor = 0.0
     for index, seg in enumerate(segments):
         out = tts_dir / f"voice_{index:04d}.mp3"
         asyncio.run(tts_save(seg["burmese"], voice, out))
-
-        start = max(0.0, min(duration, float(seg["start"])))
-        if index + 1 < len(segments):
-            next_start = max(start, min(duration, float(segments[index + 1]["start"])))
-            available = next_start - start
-        else:
-            available = duration - start
-
-        # Each generated speech clip is confined to its own timeline slot.
-        # This prevents two Burmese TTS clips from playing over one another.
-        available = max(0.05, available)
         tts_duration = probe_duration(out)
-        speed = max(1.0, tts_duration / available)
-
-        adjusted = tts_dir / f"voice_{index:04d}_fit.mp3"
-        filters = []
-        remaining_speed = speed
-        while remaining_speed > 2.0:
-            filters.append("atempo=2.0")
-            remaining_speed /= 2.0
-        filters.append(f"atempo={remaining_speed:.5f}")
-        filters.append(f"atrim=duration={available:.3f}")
-        filters.append("asetpts=PTS-STARTPTS")
-
-        run_cmd([
-            ffmpeg_path(), "-y", "-i", str(out),
-            "-filter:a", ",".join(filters),
-            "-c:a", "libmp3lame", "-b:a", "96k", str(adjusted)
-        ], timeout=180)
-
+        requested_start = max(0.0, min(duration, float(seg["start"])))
+        start = max(requested_start, cursor)
+        if index + 1 < len(segments):
+            next_start = max(start + 0.25, min(duration, float(segments[index + 1]["start"])))
+            available = max(0.25, next_start - start)
+        else:
+            available = max(0.25, duration - start)
+        speed = min(2.0, max(1.0, tts_duration / available))
+        adjusted = out
+        adjusted_duration = tts_duration / speed
+        if speed > 1.02 or adjusted_duration > available:
+            adjusted = tts_dir / f"voice_{index:04d}_fit.mp3"
+            run_cmd([ffmpeg_path(), "-y", "-i", str(out), "-af",
+                     f"atempo={speed:.3f},atrim=duration={available:.3f},asetpts=PTS-STARTPTS",
+                     "-c:a", "libmp3lame", "-b:a", "96k", str(adjusted)], timeout=180)
         prepared.append((adjusted, int(start * 1000)))
+        cursor = min(duration, start + min(available, adjusted_duration))
         if progress_callback:
             progress_callback((index + 1) / len(segments))
-
     return prepared
 
 
-def render_dubbed_video(source, prepared_audio, duration, srt_path, output_path, burn_subtitles):
+def render_dubbed_video(source, prepared_audio, duration, srt_path, output_path,
+                        burn_subtitles, blur_regions=None, subtitle_size=30,
+                        subtitle_color="White", subtitle_position="အောက်"):
+    blur_regions = blur_regions or []
     args = [ffmpeg_path(), "-y", "-i", str(source), "-f", "lavfi", "-t", str(duration),
             "-i", "anullsrc=r=24000:cl=mono"]
     for audio_path, _ in prepared_audio:
@@ -282,20 +296,47 @@ def render_dubbed_video(source, prepared_audio, duration, srt_path, output_path,
     filters = [f"[1:a]atrim=duration={duration:.3f},asetpts=PTS-STARTPTS[base]"]
     mix_labels = ["[base]"]
     for i, (_, delay_ms) in enumerate(prepared_audio, start=2):
-        label = f"v{i}"
+        label = f"voice{i}"
         filters.append(f"[{i}:a]aresample=24000,adelay=delays={delay_ms}:all=1[{label}]")
         mix_labels.append(f"[{label}]")
     filters.append("".join(mix_labels) +
-                   f"amix=inputs={len(mix_labels)}:duration=first:dropout_transition=0:normalize=0," +
+                   f"amix=inputs={len(mix_labels)}:duration=first:dropout_transition=0:normalize=0,"
                    f"atrim=duration={duration:.3f},asetpts=PTS-STARTPTS[aout]")
-    video_filter = ""
+
+    current_video = "0:v"
+    frame_w, frame_h = probe_video_info(source)
+    for i, region in enumerate(blur_regions):
+        x, y, w, h = [int(v) for v in (region["x"], region["y"], region["w"], region["h"])]
+        x, y = max(0, x), max(0, y)
+        x, y = x - x % 2, y - y % 2
+        w = max(2, min(frame_w - x, w))
+        h = max(2, min(frame_h - y, h))
+        w, h = w - w % 2, h - h % 2
+        start_t, end_t = float(region["start"]), float(region["end"])
+        if end_t <= start_t:
+            raise RuntimeError(f"Blur နေရာ {i+1} ၏ အချိန်အပိုင်းအခြား မမှန်ပါ။")
+        strength = max(2, min(40, int(region["strength"])))
+        base_label, source_label, blur_label, out_label = (
+            f"vbase{i}", f"vsrc{i}", f"vblur{i}", f"vout{i}")
+        filters.append(f"[{current_video}]split=2[{base_label}][{source_label}]")
+        filters.append(f"[{source_label}]crop={w}:{h}:{x}:{y},boxblur={strength}:2[{blur_label}]")
+        filters.append(f"[{base_label}][{blur_label}]overlay={x}:{y}:"
+                       f"enable='between(t,{start_t:.3f},{end_t:.3f})'[{out_label}]")
+        current_video = out_label
+
+    video_label = current_video
+    video_filtered = bool(blur_regions) or bool(burn_subtitles)
     if burn_subtitles:
-        srt_arg = str(srt_path).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
-        video_filter = f"-vf subtitles='{srt_arg}'"
-    args += ["-filter_complex", ";".join(filters), "-map", "0:v:0", "-map", "[aout]"]
-    if burn_subtitles:
-        args += ["-vf", f"subtitles='{srt_arg}'"]
-    args += ["-t", f"{duration:.3f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+        srt_arg = str(srt_path).replace("\\\\", "/").replace(":", "\\:").replace("'", "\\'")
+        color_map = {"White": "&H00FFFFFF", "Yellow": "&H0000FFFF", "Cyan": "&H00FFFF00"}
+        alignment = {"အောက်": 2, "အလယ်": 5, "အပေါ်": 8}.get(subtitle_position, 2)
+        force_style = (f"FontSize={int(subtitle_size)},PrimaryColour={color_map.get(subtitle_color, '&H00FFFFFF')},"
+                       f"Outline=2,Shadow=1,Alignment={alignment},MarginV=36")
+        filters.append(f"[{video_label}]subtitles='{srt_arg}':force_style='{force_style}'[vfinal]")
+        video_label = "vfinal"
+    args += ["-filter_complex", ";".join(filters)]
+    args += ["-map", f"[{video_label}]" if video_filtered else "0:v:0", "-map", "[aout]",
+             "-t", f"{duration:.3f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
              "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", "-shortest", str(output_path)]
     run_cmd(args, timeout=7200)
 
@@ -303,7 +344,7 @@ def render_dubbed_video(source, prepared_audio, duration, srt_path, output_path,
 def main():
     st.title(APP_TITLE)
     st.write("Video တစ်ခုတည်းတင်ပါ။ မူရင်းအသံအားလုံးကို ဖယ်ရှားပြီး မြန်မာအသံနဲ့ အစားထိုးပေးပါမယ်။")
-    st.info("မူရင်းစကားပြောသံ၊ တေးဂီတ၊ ပတ်ဝန်းကျင်အသံအားလုံးကို Final MP4 ထဲ မထည့်ပါ။")
+    st.info("မူရင်းစကားပြောသံ၊ တေးဂီတ၊ ပတ်ဝန်းကျင်အသံအားလုံးကို Final MP4 ထဲ မထည့်ပါ။ Blur နေရာကို Preview ပေါ်တွင် ကိုယ်တိုင်ဆွဲရွေးနိုင်ပါသည်။")
 
     gemini_key = secret("GEMINI_API_KEY")
     groq_key = secret("GROQ_API_KEY")
@@ -318,7 +359,103 @@ def main():
     uploaded = st.file_uploader("Video တင်ပါ (MP4 / MOV / MKV / WEBM)", type=["mp4", "mov", "mkv", "webm"])
     voice_label = st.selectbox("မြန်မာအသံရွေးချယ်ပါ", ["နီလာ (မိန်းကလေး)", "သီဟ (ယောက်ျားလေး)"])
     burn_subtitles = st.checkbox("မြန်မာစာတန်းထိုးကို Video ပေါ်တွင်ပါ ထည့်မယ်", value=True)
-    st.caption("Video ကြာချိန်ကို မူရင်းအတိုင်း ထိန်းထားပါမယ်။ အသံအချိန်မကိုက်တဲ့ အပိုင်းတွေမှာ အသံအမြန်နှုန်းကို အနည်းငယ်ညှိနိုင်ပါတယ်။")
+    subtitle_size = st.slider("စာတန်းထိုး စာလုံးအရွယ်", 18, 48, 30)
+    subtitle_color = st.selectbox("စာတန်းထိုး အရောင်", ["White", "Yellow", "Cyan"])
+    subtitle_position = st.selectbox("စာတန်းထိုး နေရာ", ["အောက်", "အလယ်", "အပေါ်"])
+    st.caption("Video ကြာချိန်ကို မူရင်းအတိုင်း ထိန်းထားပြီး မူရင်းအသံ Track ကို Final MP4 မှ ဖယ်ရှားပါမယ်။")
+
+    blur_regions = []
+    if uploaded:
+        st.subheader("🎞️ Video Preview နှင့် ကိုယ်တိုင် Blur ရွေးချယ်ခြင်း")
+        st.video(uploaded)
+        preview_key = hashlib.md5(uploaded.getvalue()).hexdigest()[:12]
+        if st.session_state.get("blur_video_hash") != preview_key:
+            st.session_state["blur_video_hash"] = preview_key
+            st.session_state["saved_blur_regions"] = []
+        preview_dir = Path(tempfile.gettempdir()) / "myanmar_dub_preview"
+        preview_dir.mkdir(exist_ok=True)
+        preview_video = preview_dir / f"{preview_key}.mp4"
+        if not preview_video.exists():
+            preview_video.write_bytes(uploaded.getbuffer())
+        try:
+            preview_duration = probe_duration(preview_video)
+            video_w, video_h = probe_video_info(preview_video)
+            preview_time = st.slider("Blur နေရာရွေးရန် Video အချိန် (စက္ကန့်)", 0.0,
+                                     float(max(0.1, preview_duration)), 0.0, 0.5)
+            frame_path = preview_dir / f"{preview_key}_{int(preview_time*10)}.jpg"
+            if not frame_path.exists():
+                extract_preview_frame(preview_video, preview_time, frame_path)
+            frame = Image.open(frame_path).convert("RGB")
+            canvas_w, canvas_h = frame.size
+            st.caption("Preview ပေါ်တွင် Blur လုပ်လိုသောနေရာကို လေးထောင့်ပုံ ဆွဲရွေးပါ။ တစ်ကြိမ်သိမ်းပြီး နောက်နေရာများကို ထပ်ရွေးနိုင်ပါတယ်။")
+            try:
+                from streamlit_drawable_canvas import st_canvas
+                canvas = st_canvas(
+                    fill_color="rgba(255, 0, 0, 0.18)", stroke_width=3,
+                    stroke_color="#ff3333", background_image=frame,
+                    update_streamlit=True, height=canvas_h, width=canvas_w,
+                    drawing_mode="rect",
+                    key=f"blur_canvas_{preview_key}_{len(st.session_state.get('saved_blur_regions', []))}_{int(preview_time*10)}",
+                )
+                blur_start = st.number_input("ဒီ Blur စတင်မည့်အချိန် (စက္ကန့်)", 0.0,
+                                              float(preview_duration), float(preview_time), 0.1)
+                blur_end = st.number_input("ဒီ Blur ပြီးဆုံးမည့်အချိန် (စက္ကန့်)", 0.1,
+                                            float(preview_duration), float(min(preview_duration, preview_time + 5.0)), 0.1)
+                blur_strength = st.slider("Blur အား", 2, 40, 18)
+                if st.button("➕ ရွေးထားသော Blur နေရာကို သိမ်းမယ်"):
+                    objects = (canvas.json_data or {}).get("objects", []) if canvas.json_data else []
+                    rects = [o for o in objects if o.get("type") == "rect" and o.get("width", 0) > 2 and o.get("height", 0) > 2]
+                    if not rects:
+                        st.warning("အရင်ဆုံး Preview ပေါ်မှာ လေးထောင့်ပုံ ဆွဲရွေးပါ။")
+                    elif blur_end <= blur_start:
+                        st.warning("Blur ပြီးဆုံးချိန်သည် စတင်ချိန်ထက် နောက်ကျရပါမယ်။")
+                    else:
+                        saved = st.session_state.setdefault("saved_blur_regions", [])
+                        sx, sy = video_w / canvas_w, video_h / canvas_h
+                        for rect in rects:
+                            left = max(0, int(rect.get("left", 0) * sx))
+                            top = max(0, int(rect.get("top", 0) * sy))
+                            width = int(rect.get("width", 0) * float(rect.get("scaleX", 1)) * sx)
+                            height = int(rect.get("height", 0) * float(rect.get("scaleY", 1)) * sy)
+                            left -= left % 2
+                            top -= top % 2
+                            width = max(2, min(video_w - left, width - width % 2))
+                            height = max(2, min(video_h - top, height - height % 2))
+                            saved.append({"x": left, "y": top, "w": width, "h": height,
+                                          "start": float(blur_start), "end": float(blur_end),
+                                          "strength": int(blur_strength)})
+                        st.success(f"Blur နေရာ {len(rects)} ခု သိမ်းပြီးပါပြီ။")
+                        st.rerun()
+                saved = st.session_state.get("saved_blur_regions", [])
+                if saved:
+                    st.write("သိမ်းထားသော Blur နေရာများ — တစ်ခုချင်း ပြင်နိုင် / ဖျက်နိုင်သည်")
+                    for i, region in enumerate(saved):
+                        with st.expander(f"Blur နေရာ {i+1} | {region['start']:.1f}s – {region['end']:.1f}s"):
+                            c1, c2, c3 = st.columns(3)
+                            region["start"] = c1.number_input("စတင်ချိန်", 0.0, float(preview_duration),
+                                                               float(region["start"]), 0.1, key=f"brs_{preview_key}_{i}")
+                            region["end"] = c2.number_input("ပြီးဆုံးချိန်", 0.1, float(preview_duration),
+                                                             float(region["end"]), 0.1, key=f"bre_{preview_key}_{i}")
+                            region["strength"] = c3.slider("Blur အား", 2, 40, int(region["strength"]),
+                                                           key=f"brf_{preview_key}_{i}")
+                            c4, c5, c6, c7 = st.columns(4)
+                            region["x"] = c4.number_input("X", 0, video_w-2, int(region["x"]), key=f"brx_{preview_key}_{i}")
+                            region["y"] = c5.number_input("Y", 0, video_h-2, int(region["y"]), key=f"bry_{preview_key}_{i}")
+                            region["w"] = c6.number_input("အကျယ်", 2, video_w, int(region["w"]), key=f"brw_{preview_key}_{i}")
+                            region["h"] = c7.number_input("အမြင့်", 2, video_h, int(region["h"]), key=f"brh_{preview_key}_{i}")
+                            if st.button(f"ဒီ Blur နေရာ {i+1} ကို ဖျက်မယ်", key=f"brdel_{preview_key}_{i}"):
+                                saved.pop(i)
+                                st.session_state["saved_blur_regions"] = saved
+                                st.rerun()
+                    st.session_state["saved_blur_regions"] = saved
+                    if st.button("သိမ်းထားသော Blur အားလုံး ဖျက်မယ်", key=f"clear_blur_{preview_key}"):
+                        st.session_state["saved_blur_regions"] = []
+                        st.rerun()
+                    blur_regions = saved
+            except ImportError:
+                st.warning("Blur Canvas library မရှိသေးပါ။ requirements.txt ကို update လုပ်ပြီး redeploy လုပ်ပါ။")
+        except Exception as preview_error:
+            st.warning(f"Preview ပြင်ဆင်ရာတွင် အမှားရှိသည်: {preview_error}")
 
     if uploaded and uploaded.size > MAX_MB * 1024 * 1024:
         st.error(f"Video သည် {MAX_MB} MB ထက်ကျော်နေပါသည်။")
@@ -378,7 +515,9 @@ def main():
                 set_progress(84, "မြန်မာအသံနှင့် SRT ပြင်ဆင်ပြီးပါပြီ")
 
                 status.info("မူရင်းအသံ Track ကို ဖယ်ရှားပြီး မြန်မာအသံတစ်ခုတည်း ထည့်နေသည်...")
-                render_dubbed_video(video, prepared_audio, duration, output_srt, output_mp4, burn_subtitles)
+                render_dubbed_video(video, prepared_audio, duration, output_srt, output_mp4, burn_subtitles,
+                                    blur_regions=blur_regions, subtitle_size=subtitle_size,
+                                    subtitle_color=subtitle_color, subtitle_position=subtitle_position)
                 # Export a standalone MP3 from the final MP4 audio, ensuring it matches the final mix.
                 run_cmd([ffmpeg_path(), "-y", "-i", str(output_mp4), "-vn", "-c:a", "libmp3lame",
                          "-b:a", "160k", str(output_mp3)], timeout=1200)
