@@ -389,16 +389,33 @@ def main():
             canvas_w, canvas_h = frame.size
             st.caption("Preview ပေါ်တွင် Blur လုပ်လိုသောနေရာကို လေးထောင့်ပုံ ဆွဲရွေးပါ။ တစ်ကြိမ်သိမ်းပြီး နောက်နေရာများကို ထပ်ရွေးနိုင်ပါတယ်။")
             try:
-                # Compatibility shim: streamlit-drawable-canvas 0.9.3 still
-                # looks for image_to_url on streamlit.elements.image. Newer
-                # Streamlit releases moved that helper into lib.image_utils.
+                # Compatibility shim for streamlit-drawable-canvas 0.9.3
+                # with recent Streamlit versions (including 1.51+).
+                # The canvas package passes an integer width, while modern
+                # Streamlit expects a layout object that also exposes .width.
+                import importlib
                 import streamlit.elements.image as st_image
-                if not hasattr(st_image, "image_to_url"):
-                    try:
-                        from streamlit.elements.lib.image_utils import image_to_url
-                    except ImportError:
-                        from streamlit.elements.image_utils import image_to_url
-                    st_image.image_to_url = image_to_url
+                from streamlit.elements.lib import image_utils as _image_utils
+
+                # Reload to avoid retaining a stale/incompatible monkey patch.
+                _image_utils = importlib.reload(_image_utils)
+
+                class _CanvasLayoutConfig(int):
+                    def __new__(cls, value=None):
+                        numeric = -1 if value is None else int(value)
+                        return super().__new__(cls, numeric)
+
+                    def __init__(self, value=None):
+                        self.width = value
+
+                def _canvas_image_to_url(image, width, clamp, channels, output_format, image_id):
+                    if width is None or isinstance(width, (int, float)):
+                        width = _CanvasLayoutConfig(width)
+                    return _image_utils.image_to_url(
+                        image, width, clamp, channels, output_format, image_id
+                    )
+
+                st_image.image_to_url = _canvas_image_to_url
                 from streamlit_drawable_canvas import st_canvas
                 canvas = st_canvas(
                     fill_color="rgba(255, 0, 0, 0.18)", stroke_width=3,
