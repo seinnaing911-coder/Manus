@@ -30,3 +30,7 @@ Keep API keys private. Do not commit real keys to GitHub.
 - Blur areas are rectangles drawn on the selected preview frame. Their time range controls when the blur appears.
 - Speech recognition timestamps may not be perfect. Very long Burmese lines can be shortened by fitting them into the available slot.
 - Streamlit Cloud CPU, memory, execution time, network access and provider quotas can limit large-video processing.
+
+
+### Preview canvas compatibility fix
+This build includes a compatibility shim for Streamlit versions that moved `image_to_url`, preventing the preview canvas AttributeError.

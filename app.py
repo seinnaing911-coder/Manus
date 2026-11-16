@@ -389,6 +389,16 @@ def main():
             canvas_w, canvas_h = frame.size
             st.caption("Preview ပေါ်တွင် Blur လုပ်လိုသောနေရာကို လေးထောင့်ပုံ ဆွဲရွေးပါ။ တစ်ကြိမ်သိမ်းပြီး နောက်နေရာများကို ထပ်ရွေးနိုင်ပါတယ်။")
             try:
+                # Compatibility shim: streamlit-drawable-canvas 0.9.3 still
+                # looks for image_to_url on streamlit.elements.image. Newer
+                # Streamlit releases moved that helper into lib.image_utils.
+                import streamlit.elements.image as st_image
+                if not hasattr(st_image, "image_to_url"):
+                    try:
+                        from streamlit.elements.lib.image_utils import image_to_url
+                    except ImportError:
+                        from streamlit.elements.image_utils import image_to_url
+                    st_image.image_to_url = image_to_url
                 from streamlit_drawable_canvas import st_canvas
                 canvas = st_canvas(
                     fill_color="rgba(255, 0, 0, 0.18)", stroke_width=3,
