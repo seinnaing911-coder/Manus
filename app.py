@@ -233,22 +233,44 @@ def build_voice_track(segments, voice, workdir, duration, progress_callback=None
     tts_dir = workdir / "tts_segments"
     tts_dir.mkdir(exist_ok=True)
     prepared = []
+
     for index, seg in enumerate(segments):
         out = tts_dir / f"voice_{index:04d}.mp3"
         asyncio.run(tts_save(seg["burmese"], voice, out))
+
+        start = max(0.0, min(duration, float(seg["start"])))
+        if index + 1 < len(segments):
+            next_start = max(start, min(duration, float(segments[index + 1]["start"])))
+            available = next_start - start
+        else:
+            available = duration - start
+
+        # Each generated speech clip is confined to its own timeline slot.
+        # This prevents two Burmese TTS clips from playing over one another.
+        available = max(0.05, available)
         tts_duration = probe_duration(out)
-        start = max(0.0, min(duration, seg["start"]))
-        available = max(0.35, (segments[index + 1]["start"] - start) if index + 1 < len(segments) else duration - start)
-        # Keep speech at a natural rate where possible. Speed up only when it exceeds the next speech slot.
-        speed = min(1.5, max(1.0, tts_duration / available))
-        adjusted = out
-        if speed > 1.02:
-            adjusted = tts_dir / f"voice_{index:04d}_fit.mp3"
-            run_cmd([ffmpeg_path(), "-y", "-i", str(out), "-filter:a", f"atempo={speed:.3f}",
-                     "-c:a", "libmp3lame", "-b:a", "96k", str(adjusted)], timeout=180)
+        speed = max(1.0, tts_duration / available)
+
+        adjusted = tts_dir / f"voice_{index:04d}_fit.mp3"
+        filters = []
+        remaining_speed = speed
+        while remaining_speed > 2.0:
+            filters.append("atempo=2.0")
+            remaining_speed /= 2.0
+        filters.append(f"atempo={remaining_speed:.5f}")
+        filters.append(f"atrim=duration={available:.3f}")
+        filters.append("asetpts=PTS-STARTPTS")
+
+        run_cmd([
+            ffmpeg_path(), "-y", "-i", str(out),
+            "-filter:a", ",".join(filters),
+            "-c:a", "libmp3lame", "-b:a", "96k", str(adjusted)
+        ], timeout=180)
+
         prepared.append((adjusted, int(start * 1000)))
         if progress_callback:
             progress_callback((index + 1) / len(segments))
+
     return prepared
 
 
