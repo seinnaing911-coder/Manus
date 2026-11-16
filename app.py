@@ -1,7 +1,6 @@
 import os, re, json, time, tempfile, subprocess, shutil, asyncio
 from pathlib import Path
 
-
 import streamlit as st
 import requests
 import edge_tts
@@ -43,16 +42,8 @@ def probe_duration(path):
     return max(0.1, float(value))
 
 
-def has_audio_stream(path):
-    raw = run_cmd(["ffprobe", "-v", "error", "-select_streams", "a:0",
-                   "-show_entries", "stream=index", "-of", "json", str(path)])
-    return bool(json.loads(raw).get("streams") or [])
-
-
 def extract_audio(video_path, audio_path):
     # Original audio is extracted only for transcription. It is never copied to the final MP4.
-    if not has_audio_stream(video_path):
-        raise RuntimeError("ဒီ Video ထဲမှာ မူရင်းအသံ Track မရှိပါ။ စကားပြောသံပါဝင်သော Video ကို တင်ပေးပါ။")
     run_cmd([ffmpeg_path(), "-y", "-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000",
              "-c:a", "libmp3lame", "-b:a", "48k", str(audio_path)], timeout=1800)
 
@@ -239,69 +230,86 @@ def write_srt(segments, duration, path):
 
 
 def build_voice_track(segments, voice, workdir, duration, progress_callback=None):
+    """
+    Create non-overlapping Burmese voice clips.
+    Each clip is hard-limited to the time before the next segment starts,
+    so amix can never play two generated voices over one another.
+    """
     tts_dir = workdir / "tts_segments"
     tts_dir.mkdir(exist_ok=True)
     prepared = []
-    cursor = 0.0
+
     for index, seg in enumerate(segments):
         out = tts_dir / f"voice_{index:04d}.mp3"
         asyncio.run(tts_save(seg["burmese"], voice, out))
         tts_duration = probe_duration(out)
-        requested_start = max(0.0, min(duration, float(seg["start"])))
-        start = max(requested_start, cursor)
+
+        start = max(0.0, min(duration, float(seg["start"])))
         if index + 1 < len(segments):
-            next_start = max(start + 0.25, min(duration, float(segments[index + 1]["start"])))
-            available = max(0.25, next_start - start)
+            next_start = max(start, min(duration, float(segments[index + 1]["start"])))
+            # Leave a small guard interval to account for codec padding and
+            # timestamp rounding; the next voice begins after this clip ends.
+            available = max(0.05, next_start - start - 0.06)
         else:
-            available = max(0.25, duration - start)
+            available = max(0.05, duration - start)
+
+        # First try a moderate speed-up. If speech is still too long, the
+        # final WAV is trimmed to the slot and gently faded at the cut.
         speed = min(2.0, max(1.0, tts_duration / available))
-        adjusted = out
-        adjusted_duration = tts_duration / speed
-        if speed > 1.02 or adjusted_duration > available:
-            adjusted = tts_dir / f"voice_{index:04d}_fit.mp3"
-            run_cmd([ffmpeg_path(), "-y", "-i", str(out), "-af",
-                     f"atempo={speed:.3f},atrim=duration={available:.3f},asetpts=PTS-STARTPTS",
-                     "-c:a", "libmp3lame", "-b:a", "96k", str(adjusted)], timeout=180)
-        prepared.append((adjusted, int(start * 1000)))
-        cursor = min(duration, start + min(available, adjusted_duration))
+        predicted_duration = tts_duration / speed
+        needs_trim = predicted_duration > available
+        adjusted = tts_dir / f"voice_{index:04d}_scheduled.wav"
+
+        filters = []
+        if speed > 1.01:
+            filters.append(f"atempo={speed:.4f}")
+        filters.append(f"atrim=duration={available:.3f}")
+        filters.append("asetpts=PTS-STARTPTS")
+        if needs_trim and available > 0.10:
+            fade_start = max(0.0, available - 0.06)
+            filters.append(f"afade=t=out:st={fade_start:.3f}:d=0.06")
+
+        run_cmd([
+            ffmpeg_path(), "-y", "-i", str(out),
+            "-af", ",".join(filters),
+            "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le",
+            str(adjusted)
+        ], timeout=180)
+
+        # Keep only clips that have a usable duration and schedule each at
+        # its original timestamp. Their hard duration limits prevent overlap.
+        actual_duration = probe_duration(adjusted)
+        if actual_duration > 0.03:
+            prepared.append((adjusted, int(start * 1000)))
+
         if progress_callback:
-            progress_callback((index + 1) / len(segments))
+            progress_callback((index + 1) / max(1, len(segments)))
+
     return prepared
 
 
-def render_dubbed_video(source, prepared_audio, duration, srt_path, output_path,
-                        burn_subtitles, subtitle_size=30,
-                        subtitle_color="White", subtitle_position="အောက်"):
-    # The source video is mapped without its original audio. Only generated
-    # Burmese TTS is mixed with a silent base track.
+def render_dubbed_video(source, prepared_audio, duration, srt_path, output_path, burn_subtitles):
     args = [ffmpeg_path(), "-y", "-i", str(source), "-f", "lavfi", "-t", str(duration),
             "-i", "anullsrc=r=24000:cl=mono"]
     for audio_path, _ in prepared_audio:
         args += ["-i", str(audio_path)]
-
     filters = [f"[1:a]atrim=duration={duration:.3f},asetpts=PTS-STARTPTS[base]"]
     mix_labels = ["[base]"]
     for i, (_, delay_ms) in enumerate(prepared_audio, start=2):
-        label = f"voice{i}"
+        label = f"v{i}"
         filters.append(f"[{i}:a]aresample=24000,adelay=delays={delay_ms}:all=1[{label}]")
         mix_labels.append(f"[{label}]")
     filters.append("".join(mix_labels) +
-                   f"amix=inputs={len(mix_labels)}:duration=first:dropout_transition=0:normalize=0,"
+                   f"amix=inputs={len(mix_labels)}:duration=first:dropout_transition=0:normalize=0," +
                    f"atrim=duration={duration:.3f},asetpts=PTS-STARTPTS[aout]")
-
-    video_label = "0:v:0"
+    video_filter = ""
     if burn_subtitles:
         srt_arg = str(srt_path).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
-        color_map = {"White": "&H00FFFFFF", "Yellow": "&H0000FFFF", "Cyan": "&H00FFFF00"}
-        alignment = {"အောက်": 2, "အလယ်": 5, "အပေါ်": 8}.get(subtitle_position, 2)
-        force_style = (f"FontSize={int(subtitle_size)},PrimaryColour={color_map.get(subtitle_color, '&H00FFFFFF')},"
-                       f"Outline=2,Shadow=1,Alignment={alignment},MarginV=36")
-        filters.append(f"[0:v:0]subtitles='{srt_arg}':force_style='{force_style}'[vfinal]")
-        video_label = "[vfinal]"
-
-    args += ["-filter_complex", ";".join(filters)]
-    args += ["-map", video_label, "-map", "[aout]",
-             "-t", f"{duration:.3f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+        video_filter = f"-vf subtitles='{srt_arg}'"
+    args += ["-filter_complex", ";".join(filters), "-map", "0:v:0", "-map", "[aout]"]
+    if burn_subtitles:
+        args += ["-vf", f"subtitles='{srt_arg}'"]
+    args += ["-t", f"{duration:.3f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
              "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", "-shortest", str(output_path)]
     run_cmd(args, timeout=7200)
 
@@ -324,14 +332,7 @@ def main():
     uploaded = st.file_uploader("Video တင်ပါ (MP4 / MOV / MKV / WEBM)", type=["mp4", "mov", "mkv", "webm"])
     voice_label = st.selectbox("မြန်မာအသံရွေးချယ်ပါ", ["နီလာ (မိန်းကလေး)", "သီဟ (ယောက်ျားလေး)"])
     burn_subtitles = st.checkbox("မြန်မာစာတန်းထိုးကို Video ပေါ်တွင်ပါ ထည့်မယ်", value=True)
-    subtitle_size = st.slider("စာတန်းထိုး စာလုံးအရွယ်", 18, 48, 30)
-    subtitle_color = st.selectbox("စာတန်းထိုး အရောင်", ["White", "Yellow", "Cyan"])
-    subtitle_position = st.selectbox("စာတန်းထိုး နေရာ", ["အောက်", "အလယ်", "အပေါ်"])
-    st.caption("Video ကြာချိန်ကို မူရင်းအတိုင်း ထိန်းထားပြီး မူရင်းအသံ Track ကို Final MP4 မှ ဖယ်ရှားပါမယ်။")
-
-    if uploaded:
-        st.subheader("🎞️ Video Preview")
-        st.video(uploaded)
+    st.caption("Video ကြာချိန်ကို မူရင်းအတိုင်း ထိန်းထားပါမယ်။ အသံအချိန်မကိုက်တဲ့ အပိုင်းတွေမှာ အသံအမြန်နှုန်းကို အနည်းငယ်ညှိနိုင်ပါတယ်။")
 
     if uploaded and uploaded.size > MAX_MB * 1024 * 1024:
         st.error(f"Video သည် {MAX_MB} MB ထက်ကျော်နေပါသည်။")
@@ -391,9 +392,7 @@ def main():
                 set_progress(84, "မြန်မာအသံနှင့် SRT ပြင်ဆင်ပြီးပါပြီ")
 
                 status.info("မူရင်းအသံ Track ကို ဖယ်ရှားပြီး မြန်မာအသံတစ်ခုတည်း ထည့်နေသည်...")
-                render_dubbed_video(video, prepared_audio, duration, output_srt, output_mp4, burn_subtitles,
-                                    subtitle_size=subtitle_size,
-                                    subtitle_color=subtitle_color, subtitle_position=subtitle_position)
+                render_dubbed_video(video, prepared_audio, duration, output_srt, output_mp4, burn_subtitles)
                 # Export a standalone MP3 from the final MP4 audio, ensuring it matches the final mix.
                 run_cmd([ffmpeg_path(), "-y", "-i", str(output_mp4), "-vn", "-c:a", "libmp3lame",
                          "-b:a", "160k", str(output_mp3)], timeout=1200)

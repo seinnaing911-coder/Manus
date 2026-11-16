@@ -1,18 +1,32 @@
-# Myanmar Auto Video Dubbing — No Blur Version
+# Myanmar Auto Video Dubbing
 
-This version removes the manual blur tool and its preview-canvas dependency. It keeps the single-video dubbing workflow, a simple video preview, Burmese voice selection, subtitle appearance controls, and MP4 / MP3 / SRT downloads.
+A single-video Streamlit app that transcribes the original speech, translates each timestamped speech segment into Burmese, generates Burmese TTS, and exports a dubbed video.
 
-## Features
-- Upload one MP4 / MOV / MKV / WEBM video (up to 500 MB configured).
-- Groq Whisper transcription with timestamps; local faster-whisper fallback.
-- Burmese translation using Gemini with OpenRouter fallback.
-- Burmese Edge TTS voices: Nilar (`my-MM-NilarNeural`) and Thiha (`my-MM-ThihaNeural`).
-- Original audio is not included in the final MP4; only generated Burmese TTS is used.
-- Optional burned-in Burmese subtitles with size, color, and position controls.
-- Download MP4, MP3, and SRT.
-- No blur features, no drawable canvas, and no `image_to_url` compatibility patch.
+## What this version does
+- Upload one MP4 / MOV / MKV / WEBM video.
+- Uses Groq Whisper to detect speech with timestamps (local faster-whisper is a fallback).
+- Translates speech segments into concise spoken Burmese using Gemini, with OpenRouter fallback.
+- Generates Burmese speech with Edge TTS voices Nilar (`my-MM-NilarNeural`) or Thiha (`my-MM-ThihaNeural`).
+- Removes the original audio track from the final MP4. Original dialogue, music, and ambient sound are not carried into the output.
+- Keeps the original video duration and places Burmese speech using detected timestamps.
+- Downloads MP4, MP3, and SRT.
 
 ## Deploy
-Replace `app.py`, `requirements.txt`, `packages.txt`, and `.streamlit/config.toml` in the GitHub repository connected to Streamlit Community Cloud. Keep your existing Streamlit Secrets unchanged.
+1. Upload `app.py`, `requirements.txt`, `packages.txt`, and `.streamlit/config.toml` to the GitHub repository connected to Streamlit Community Cloud.
+2. In Streamlit App Settings > Secrets, configure:
 
-Required Secrets: `GROQ_API_KEY` and at least one of `GEMINI_API_KEY` or `OPENROUTER_API_KEY`. `APP_PASSWORD` is optional.
+```toml
+GROQ_API_KEY = "your-groq-key"
+GEMINI_API_KEY = "your-gemini-key"
+OPENROUTER_API_KEY = "your-openrouter-key"
+APP_PASSWORD = "your-private-password"
+```
+
+At minimum, Groq plus one translation provider (Gemini or OpenRouter) is required. Keep keys private; never commit them to GitHub or paste them into chat.
+
+## Notes and limitations
+- The original audio is extracted temporarily for speech recognition only; it is not included in the final MP4.
+- Speech timestamps come from automatic speech recognition and may not be perfectly exact. If a Burmese translation is longer than the available gap, the app speeds that segment up by up to 1.5x; dense dialogue can still overlap slightly.
+- Music and ambient sounds are removed too, because the final video uses only the generated Burmese voice track.
+- Edge TTS requires network access. Provider quotas, model availability, and Streamlit Cloud CPU/time limits can affect processing.
+- A 500 MB upload limit does not guarantee every large video can be processed within Streamlit Cloud resource limits.
