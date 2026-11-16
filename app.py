@@ -15,6 +15,7 @@ OPENROUTER_MODEL = "openrouter/free"
 XAI_STT_MODEL = "grok-voice-transcribe-2.0"
 XAI_TTS_VOICE = "eve"
 XAI_TTS_LANGUAGE = "my"
+MANUS_MODEL = ""
 CHUNK_SECONDS = 480
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="centered")
@@ -205,6 +206,24 @@ def parse_json_array(raw):
     return data
 
 
+def call_manus_api(prompt, api_url, api_key, model=""):
+    payload = {"messages": [{"role": "user", "content": prompt}], "temperature": 0.2}
+    if model:
+        payload["model"] = model
+    response = requests.post(
+        api_url.rstrip("/") + "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=300,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Manus AI error {response.status_code}: {response.text[:700]}")
+    data = response.json()
+    if data.get("error"):
+        raise RuntimeError(f"Manus AI error: {data['error']}")
+    return ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+
+
 def call_grok_api(prompt, api_key):
     response = requests.post(
         "https://api.x.ai/v1/chat/completions",
@@ -219,9 +238,11 @@ def call_grok_api(prompt, api_key):
     return ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "")
 
 
-def call_translation_api(prompt, provider, api_key):
+def call_translation_api(prompt, provider, api_key, manus_url="", manus_model=""):
     if provider == "Grok":
         return call_grok_api(prompt, api_key)
+    if provider == "Manus AI":
+        return call_manus_api(prompt, manus_url, api_key, manus_model)
     if provider == "Gemini":
         from google import genai
         client = genai.Client(api_key=api_key)
@@ -237,7 +258,8 @@ def call_translation_api(prompt, provider, api_key):
     return response.json()["choices"][0]["message"]["content"]
 
 
-def translate_segments(segments, grok_key, gemini_key, openrouter_key, progress_callback=None):
+def translate_segments(segments, grok_key, manus_url, manus_key, manus_model,
+                       gemini_key, openrouter_key, progress_callback=None):
     translated = []
     batch_size = 18
     provider_order = []
@@ -258,6 +280,12 @@ def translate_segments(segments, grok_key, gemini_key, openrouter_key, progress_
                 provider_order.append("Grok")
             except Exception as exc:
                 errors.append(f"Grok: {str(exc)[:160]}")
+        if raw is None and manus_url and manus_key:
+            try:
+                raw = call_translation_api(prompt, "Manus AI", manus_key, manus_url, manus_model)
+                provider_order.append("Manus AI")
+            except Exception as exc:
+                errors.append(f"Manus AI: {str(exc)[:160]}")
         if raw is None and gemini_key:
             try:
                 raw = call_translation_api(prompt, "Gemini", gemini_key)
@@ -424,6 +452,9 @@ def main():
     st.info("မူရင်းစကားပြောသံ၊ တေးဂီတ၊ ပတ်ဝန်းကျင်အသံအားလုံးကို Final MP4 ထဲ မထည့်ပါ။ Blur နေရာကို Preview ပေါ်တွင် ကိုယ်တိုင်ဆွဲရွေးနိုင်ပါသည်။")
 
     grok_key = secret("XAI_API_KEY")
+    manus_url = secret("MANUS_API_URL")
+    manus_key = secret("MANUS_API_KEY")
+    manus_model = secret("MANUS_MODEL", MANUS_MODEL)
     gemini_key = secret("GEMINI_API_KEY")
     groq_key = secret("GROQ_API_KEY")
     openrouter_key = secret("OPENROUTER_API_KEY")
@@ -438,6 +469,8 @@ def main():
     active_providers = []
     if grok_key:
         active_providers.append("Grok")
+    if manus_url and manus_key:
+        active_providers.append("Manus AI")
     if groq_key:
         active_providers.append("Groq fallback")
     st.caption("အသုံးပြုမည့် AI providers: " + (" → ".join(active_providers) if active_providers else "မသတ်မှတ်ရသေးပါ"))
@@ -549,8 +582,8 @@ def main():
         if not (grok_key or groq_key):
             st.error("XAI_API_KEY သို့မဟုတ် GROQ_API_KEY တစ်ခု လိုအပ်ပါတယ်။")
             st.stop()
-        if not (grok_key or gemini_key or openrouter_key):
-            st.error("XAI_API_KEY လိုအပ်ပါတယ်။ Grok translation အတွက် XAI_API_KEY ထည့်ပါ။")
+        if not (grok_key or (manus_url and manus_key) or gemini_key or openrouter_key):
+            st.error("XAI_API_KEY, Manus AI credentials, GEMINI_API_KEY သို့မဟုတ် OPENROUTER_API_KEY တစ်ခု လိုအပ်ပါတယ်။")
             st.stop()
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -596,7 +629,7 @@ def main():
 
                 status.info("စာသားအပိုင်းတိုင်းကို မြန်မာလို ဘာသာပြန်နေသည်...")
                 segments, translation_provider = translate_segments(
-                    segments, grok_key, gemini_key, openrouter_key,
+                    segments, grok_key, manus_url, manus_key, manus_model, gemini_key, openrouter_key,
                     lambda fraction: set_progress(35 + fraction * 25, "မြန်မာဘာသာပြန်နေသည်"))
                 set_progress(62, f"မြန်မာဘာသာပြန်ပြီးပါပြီ ({translation_provider})")
 
