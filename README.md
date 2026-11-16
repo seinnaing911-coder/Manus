@@ -4,9 +4,9 @@ Streamlit app: one video upload, timestamped speech recognition, Burmese transla
 
 ## Included
 - One MP4 / MOV / MKV / WEBM upload.
-- Grok Voice batch transcription with Groq Whisper and local faster-whisper fallbacks.
-- Grok translation first, Manus AI JSON-compatible translation fallback, then Gemini/OpenRouter fallback.
-- Grok TTS first, with Burmese Edge TTS voices (Nilar and Thiha) as fallback.
+- Groq Whisper transcription with local faster-whisper fallback.
+- Gemini translation with OpenRouter fallback.
+- Burmese Edge TTS voices: Nilar and Thiha.
 - Original audio is removed from the final video; only generated Burmese voice is mixed.
 - Preview and manually drawn rectangular blur regions. Save multiple regions with individual start/end times and blur strength.
 - Subtitle font size, color, and vertical position settings.
@@ -18,20 +18,12 @@ Upload `app.py`, `requirements.txt`, `packages.txt`, and `.streamlit/config.toml
 
 Set these in Streamlit Cloud > App > Settings > Secrets:
 ```toml
-XAI_API_KEY = "your-xai-key"
-MANUS_API_URL = "https://your-manus-api-host"
-MANUS_API_KEY = "your-manus-key"
-MANUS_MODEL = "your-manus-model-id"
-GEMINI_API_KEY = "your-gemini-key"
 GROQ_API_KEY = "your-groq-key"
+GEMINI_API_KEY = "your-gemini-key"
 OPENROUTER_API_KEY = "your-openrouter-key"
 APP_PASSWORD = "your-private-password"
 ```
 Keep API keys private. Do not commit real keys to GitHub.
-
-## Provider order
-
-The app uses Grok as the primary provider. Grok Voice STT transcribes the uploaded audio, Grok translates the timestamped segments into concise spoken Burmese, and Grok TTS generates the replacement voice. If any Grok step fails, the app falls back to Manus AI where configured, then the existing Groq, Gemini, OpenRouter, local Whisper, or Edge TTS providers. `MANUS_API_URL` must expose the OpenAI-compatible `/v1/chat/completions` endpoint.
 
 ## Notes
 - The uploaded video must contain an audio track with speech for transcription.

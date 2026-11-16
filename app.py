@@ -12,10 +12,6 @@ MAX_MB = 500
 GROQ_STT_MODEL = "whisper-large-v3-turbo"
 GEMINI_MODEL = "gemini-3.8-flash"
 OPENROUTER_MODEL = "openrouter/free"
-XAI_STT_MODEL = "grok-voice-transcribe-2.0"
-XAI_TTS_VOICE = "eve"
-XAI_TTS_LANGUAGE = "my"
-MANUS_MODEL = ""
 CHUNK_SECONDS = 480
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="centered")
@@ -117,39 +113,6 @@ def groq_transcribe(audio_path, api_key):
     return normalize_segments(result, probe_duration(audio_path))
 
 
-def grok_transcribe(audio_path, api_key):
-    """Transcribe audio with xAI's batch Grok Voice API."""
-    url = "https://api.x.ai/v1/stt"
-    chunks = split_audio(audio_path, audio_path.parent / "grok_audio_chunks")
-    result = []
-    for index, chunk in enumerate(chunks):
-        with open(chunk, "rb") as file_obj:
-            response = requests.post(
-                url,
-                headers={"Authorization": f"Bearer {api_key}"},
-                data={"model": XAI_STT_MODEL},
-                files={"file": (chunk.name, file_obj, "audio/mpeg")},
-                timeout=900,
-            )
-        if response.status_code >= 400:
-            raise RuntimeError(f"Grok STT error {response.status_code}: {response.text[:800]}")
-        data = response.json()
-        offset = index * CHUNK_SECONDS
-        segments = data.get("segments") or []
-        if segments:
-            for item in segments:
-                text = (item.get("text") or "").strip()
-                if text:
-                    result.append({"start": float(item.get("start", 0)) + offset,
-                                   "end": float(item.get("end", item.get("start", 0) + 2)) + offset,
-                                   "text": text})
-        else:
-            text = (data.get("text") or data.get("transcript") or "").strip()
-            if text:
-                result.extend(approximate_segments(text, offset, probe_duration(chunk)))
-    return normalize_segments(result, probe_duration(audio_path))
-
-
 def approximate_segments(text, offset, duration):
     parts = [p.strip() for p in re.split(r"(?<=[.!?。！？])\s+|\n+", text) if p.strip()]
     if not parts:
@@ -206,43 +169,7 @@ def parse_json_array(raw):
     return data
 
 
-def call_manus_api(prompt, api_url, api_key, model=""):
-    payload = {"messages": [{"role": "user", "content": prompt}], "temperature": 0.2}
-    if model:
-        payload["model"] = model
-    response = requests.post(
-        api_url.rstrip("/") + "/v1/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=300,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(f"Manus AI error {response.status_code}: {response.text[:700]}")
-    data = response.json()
-    if data.get("error"):
-        raise RuntimeError(f"Manus AI error: {data['error']}")
-    return ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "")
-
-
-def call_grok_api(prompt, api_key):
-    response = requests.post(
-        "https://api.x.ai/v1/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={"model": "grok-4.7", "messages": [{"role": "user", "content": prompt}],
-              "temperature": 0.2},
-        timeout=300,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(f"Grok translation error {response.status_code}: {response.text[:700]}")
-    data = response.json()
-    return ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "")
-
-
-def call_translation_api(prompt, provider, api_key, manus_url="", manus_model=""):
-    if provider == "Grok":
-        return call_grok_api(prompt, api_key)
-    if provider == "Manus AI":
-        return call_manus_api(prompt, manus_url, api_key, manus_model)
+def call_translation_api(prompt, provider, api_key):
     if provider == "Gemini":
         from google import genai
         client = genai.Client(api_key=api_key)
@@ -258,8 +185,7 @@ def call_translation_api(prompt, provider, api_key, manus_url="", manus_model=""
     return response.json()["choices"][0]["message"]["content"]
 
 
-def translate_segments(segments, grok_key, manus_url, manus_key, manus_model,
-                       gemini_key, openrouter_key, progress_callback=None):
+def translate_segments(segments, gemini_key, openrouter_key, progress_callback=None):
     translated = []
     batch_size = 18
     provider_order = []
@@ -274,19 +200,7 @@ def translate_segments(segments, grok_key, manus_url, manus_key, manus_model,
             json.dumps(source_lines, ensure_ascii=False))
         raw = None
         errors = []
-        if grok_key:
-            try:
-                raw = call_translation_api(prompt, "Grok", grok_key)
-                provider_order.append("Grok")
-            except Exception as exc:
-                errors.append(f"Grok: {str(exc)[:160]}")
-        if raw is None and manus_url and manus_key:
-            try:
-                raw = call_translation_api(prompt, "Manus AI", manus_key, manus_url, manus_model)
-                provider_order.append("Manus AI")
-            except Exception as exc:
-                errors.append(f"Manus AI: {str(exc)[:160]}")
-        if raw is None and gemini_key:
+        if gemini_key:
             try:
                 raw = call_translation_api(prompt, "Gemini", gemini_key)
                 provider_order.append("Gemini")
@@ -323,18 +237,6 @@ async def tts_save(text, voice, path):
     await edge_tts.Communicate(text, voice).save(str(path))
 
 
-def grok_tts_save(text, api_key, path, voice_id=XAI_TTS_VOICE):
-    response = requests.post(
-        "https://api.x.ai/v1/tts",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={"text": text, "voice_id": voice_id, "language": XAI_TTS_LANGUAGE},
-        timeout=300,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(f"Grok TTS error {response.status_code}: {response.text[:700]}")
-    path.write_bytes(response.content)
-
-
 def stamp(seconds):
     milliseconds = max(0, int(seconds * 1000))
     hours, rem = divmod(milliseconds, 3600000)
@@ -352,21 +254,14 @@ def write_srt(segments, duration, path):
     path.write_text("\n".join(blocks), encoding="utf-8-sig")
 
 
-def build_voice_track(segments, voice, workdir, duration, progress_callback=None,
-                      grok_key=""):
+def build_voice_track(segments, voice, workdir, duration, progress_callback=None):
     tts_dir = workdir / "tts_segments"
     tts_dir.mkdir(exist_ok=True)
     prepared = []
     cursor = 0.0
     for index, seg in enumerate(segments):
         out = tts_dir / f"voice_{index:04d}.mp3"
-        if grok_key:
-            try:
-                grok_tts_save(seg["burmese"], grok_key, out)
-            except Exception:
-                asyncio.run(tts_save(seg["burmese"], voice, out))
-        else:
-            asyncio.run(tts_save(seg["burmese"], voice, out))
+        asyncio.run(tts_save(seg["burmese"], voice, out))
         tts_duration = probe_duration(out)
         requested_start = max(0.0, min(duration, float(seg["start"])))
         start = max(requested_start, cursor)
@@ -451,10 +346,6 @@ def main():
     st.write("Video တစ်ခုတည်းတင်ပါ။ မူရင်းအသံအားလုံးကို ဖယ်ရှားပြီး မြန်မာအသံနဲ့ အစားထိုးပေးပါမယ်။")
     st.info("မူရင်းစကားပြောသံ၊ တေးဂီတ၊ ပတ်ဝန်းကျင်အသံအားလုံးကို Final MP4 ထဲ မထည့်ပါ။ Blur နေရာကို Preview ပေါ်တွင် ကိုယ်တိုင်ဆွဲရွေးနိုင်ပါသည်။")
 
-    grok_key = secret("XAI_API_KEY")
-    manus_url = secret("MANUS_API_URL")
-    manus_key = secret("MANUS_API_KEY")
-    manus_model = secret("MANUS_MODEL", MANUS_MODEL)
     gemini_key = secret("GEMINI_API_KEY")
     groq_key = secret("GROQ_API_KEY")
     openrouter_key = secret("OPENROUTER_API_KEY")
@@ -466,14 +357,6 @@ def main():
             st.stop()
 
     uploaded = st.file_uploader("Video တင်ပါ (MP4 / MOV / MKV / WEBM)", type=["mp4", "mov", "mkv", "webm"])
-    active_providers = []
-    if grok_key:
-        active_providers.append("Grok")
-    if manus_url and manus_key:
-        active_providers.append("Manus AI")
-    if groq_key:
-        active_providers.append("Groq fallback")
-    st.caption("အသုံးပြုမည့် AI providers: " + (" → ".join(active_providers) if active_providers else "မသတ်မှတ်ရသေးပါ"))
     voice_label = st.selectbox("မြန်မာအသံရွေးချယ်ပါ", ["နီလာ (မိန်းကလေး)", "သီဟ (ယောက်ျားလေး)"])
     burn_subtitles = st.checkbox("မြန်မာစာတန်းထိုးကို Video ပေါ်တွင်ပါ ထည့်မယ်", value=True)
     subtitle_size = st.slider("စာတန်းထိုး စာလုံးအရွယ်", 18, 48, 30)
@@ -579,11 +462,11 @@ def main():
         st.stop()
 
     if st.button("🎙️ မြန်မာအသံနဲ့ Dubbing လုပ်မယ်", type="primary", disabled=uploaded is None):
-        if not (grok_key or groq_key):
-            st.error("XAI_API_KEY သို့မဟုတ် GROQ_API_KEY တစ်ခု လိုအပ်ပါတယ်။")
+        if not groq_key:
+            st.error("GROQ_API_KEY လိုအပ်ပါတယ်။ Groq Whisper က မူရင်းအသံကို အချိန်မှတ်တမ်းနဲ့ စာသားဖော်ထုတ်ပေးပါမယ်။")
             st.stop()
-        if not (grok_key or (manus_url and manus_key) or gemini_key or openrouter_key):
-            st.error("XAI_API_KEY, Manus AI credentials, GEMINI_API_KEY သို့မဟုတ် OPENROUTER_API_KEY တစ်ခု လိုအပ်ပါတယ်။")
+        if not (gemini_key or openrouter_key):
+            st.error("GEMINI_API_KEY သို့မဟုတ် OPENROUTER_API_KEY တစ်ခု လိုအပ်ပါတယ်။")
             st.stop()
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -607,29 +490,19 @@ def main():
                 extract_audio(video, original_audio)
                 set_progress(8, "အသံဖိုင် ပြင်ဆင်ပြီးပါပြီ")
 
-                status.info("Grok Voice STT ဖြင့် မူရင်းစကားပြောသံနှင့် အချိန်မှတ်တမ်း ထုတ်ယူနေသည်...")
+                status.info("Groq Whisper ဖြင့် မူရင်းစကားပြောသံနှင့် အချိန်မှတ်တမ်း ထုတ်ယူနေသည်...")
                 try:
-                    if not grok_key:
-                        raise RuntimeError("XAI_API_KEY မရှိပါ")
-                    segments = grok_transcribe(original_audio, grok_key)
-                except Exception as grok_error:
-                    if not groq_key:
-                        status.warning(f"Grok မအောင်မြင်ပါ။ Local Whisper ကို စမ်းသုံးနေသည်။ {str(grok_error)[:180]}")
-                        segments = local_whisper_transcribe(original_audio)
-                    else:
-                        status.warning(f"Grok မအောင်မြင်ပါ။ Groq Whisper fallback ကို စမ်းသုံးနေသည်။ {str(grok_error)[:180]}")
-                        try:
-                            segments = groq_transcribe(original_audio, groq_key)
-                        except Exception as groq_error:
-                            status.warning(f"Groq မအောင်မြင်ပါ။ Local Whisper ကို စမ်းသုံးနေသည်။ {str(groq_error)[:180]}")
-                            segments = local_whisper_transcribe(original_audio)
+                    segments = groq_transcribe(original_audio, groq_key)
+                except Exception as groq_error:
+                    status.warning(f"Groq မအောင်မြင်ပါ။ Local Whisper ကို စမ်းသုံးနေသည်။ {str(groq_error)[:180]}")
+                    segments = local_whisper_transcribe(original_audio)
                 if not segments:
                     raise RuntimeError("မူရင်းစကားပြောသံမှ စာသားမရရှိပါ။ Video ထဲတွင် အသံရှိ/မရှိ စစ်ဆေးပါ။")
                 set_progress(35, f"စကားပြောအပိုင်း {len(segments)} ခု ဖော်ထုတ်ပြီးပါပြီ")
 
                 status.info("စာသားအပိုင်းတိုင်းကို မြန်မာလို ဘာသာပြန်နေသည်...")
                 segments, translation_provider = translate_segments(
-                    segments, grok_key, manus_url, manus_key, manus_model, gemini_key, openrouter_key,
+                    segments, gemini_key, openrouter_key,
                     lambda fraction: set_progress(35 + fraction * 25, "မြန်မာဘာသာပြန်နေသည်"))
                 set_progress(62, f"မြန်မာဘာသာပြန်ပြီးပါပြီ ({translation_provider})")
 
@@ -637,14 +510,12 @@ def main():
                 status.info("မြန်မာအသံ အပိုင်းလိုက် ဖန်တီးပြီး မူရင်းအချိန်နဲ့ ညှိနေသည်...")
                 prepared_audio = build_voice_track(
                     segments, voice, work, duration,
-                    lambda fraction: set_progress(62 + fraction * 20, "မြန်မာအသံ ဖန်တီးနေသည်"),
-                    grok_key=grok_key)
+                    lambda fraction: set_progress(62 + fraction * 20, "မြန်မာအသံ ဖန်တီးနေသည်"))
                 write_srt(segments, duration, output_srt)
                 set_progress(84, "မြန်မာအသံနှင့် SRT ပြင်ဆင်ပြီးပါပြီ")
 
                 status.info("မူရင်းအသံ Track ကို ဖယ်ရှားပြီး မြန်မာအသံတစ်ခုတည်း ထည့်နေသည်...")
-                render_dubbed_video(video, prepared_audio, duration, output_srt, output_mp4,
-                                    burn_subtitles,
+                render_dubbed_video(video, prepared_audio, duration, output_srt, output_mp4, burn_subtitles,
                                     blur_regions=blur_regions, subtitle_size=subtitle_size,
                                     subtitle_color=subtitle_color, subtitle_position=subtitle_position)
                 # Export a standalone MP3 from the final MP4 audio, ensuring it matches the final mix.
